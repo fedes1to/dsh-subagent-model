@@ -250,6 +250,44 @@ assert.match(USAGE, /set <provider>\/<model>/)
   assert.equal(read('missing'), undefined)
 }
 
+// --- Agent Teams and workflow shapes ---------------------------------------
+
+{
+  // A teammate: the Lead reserves the child id and passes no route. Stamped.
+  const subagents = fakeSubagents()
+  const { read } = mount(
+    { provider: 'bifrost', model: 'anthropic/claude-haiku-5-5', stateFile: statePathFor() },
+    { subagents },
+  )
+  const teammate = spec({ childId: 'reserved-child', label: 'reviewer' })
+  await read('subagents').startActivation(teammate)
+  const dispatched = subagents.calls[0]
+  assert.equal(dispatched.childId, 'reserved-child', 'the reserved child id survives')
+  assert.equal(dispatched.delivery, 'parent')
+  assert.deepEqual(dispatched.request.agentOptions, {
+    provider: 'bifrost',
+    model: 'anthropic/claude-haiku-5-5',
+  })
+}
+
+{
+  // A workflow child: caller delivery, no route. Stamped.
+  const subagents = fakeSubagents()
+  const { read } = mount({ provider: 'bifrost', model: 'm', stateFile: statePathFor() }, { subagents })
+  await read('subagents').startActivation(spec({ delivery: 'caller' }))
+  assert.equal(subagents.calls[0].delivery, 'caller')
+  assert.deepEqual(subagents.calls[0].request.agentOptions, { provider: 'bifrost', model: 'm' })
+}
+
+{
+  // A fork-context teammate keeps the Lead's route by default.
+  const subagents = fakeSubagents()
+  const { read } = mount({ provider: 'bifrost', model: 'm', stateFile: statePathFor() }, { subagents })
+  const forkedTeammate = spec({ provider: 'fork', childId: 'reserved-fork' })
+  await read('subagents').startActivation(forkedTeammate)
+  assert.equal(subagents.calls[0], forkedTeammate)
+}
+
 // --- command ----------------------------------------------------------------
 
 {
