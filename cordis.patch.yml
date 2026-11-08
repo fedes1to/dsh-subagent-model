@@ -1,0 +1,9 @@
+# dsh-subagent-model bundle patch: mount the plugin as a profile row.
+#
+# Override by id in the profile's own cordis.patch.yml user layer — do NOT
+# insert a second same-id row. Omitting every key leaves the route unset, so
+# nothing is stamped until you configure one (or run /subagent-model set).
+- insert:
+    - id: subagent-model
+      name: 'dsh-subagent-model'
+      config: {}
