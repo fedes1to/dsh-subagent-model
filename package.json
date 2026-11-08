@@ -1,7 +1,16 @@
 {
   "name": "dsh-subagent-model",
   "version": "0.1.0",
-  "description": "dsh plugin: run delegated subagents, workflow children and Agent Teams teammates on the model you choose, switchable at runtime with /subagent-model",
+  "description": "dsh plugin: run delegated subagents, workflow children and Agent Teams teammates on the model you choose, per teammate when you want, switchable at runtime with /subagent-model",
+  "author": "fedes1to",
+  "repository": {
+    "type": "git",
+    "url": "git+https://git.fedesito.me/fedes1to/dsh-subagent-model.git"
+  },
+  "homepage": "https://git.fedesito.me/fedes1to/dsh-subagent-model",
+  "bugs": {
+    "url": "https://git.fedesito.me/fedes1to/dsh-subagent-model/issues"
+  },
   "type": "module",
   "main": "./index.js",
   "exports": {
