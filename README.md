@@ -34,14 +34,19 @@ one, at the single point every dispatch path shares.
 ## Install
 
 ```sh
-dsh plugin --profile dsh-tui add link:/home/fed/Projects/repos/dsh-subagent-model
+dsh plugin --profile dsh-tui add git+https://git.fedesito.me/fedes1to/dsh-subagent-model.git
 ```
 
-Or from a registry / git checkout:
+From a local checkout instead (development):
+
+```sh
+dsh plugin --profile dsh-tui add link:/path/to/dsh-subagent-model
+```
+
+From a registry, once published:
 
 ```sh
 dsh plugin --profile dsh-tui add dsh-subagent-model
-dsh plugin --profile dsh-tui add git+https://example.com/you/dsh-subagent-model.git
 ```
 
 The package declares `dsh.bundle.patch`, so `dsh plugin add` also appends it to
