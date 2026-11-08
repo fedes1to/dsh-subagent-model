@@ -1,14 +1,16 @@
 # dsh-subagent-model
 
-A dsh plugin that **runs delegated children on the model you choose**, and lets
-you change it at runtime with `/subagent-model`.
+A dsh plugin that **runs delegated children on the model you choose** — one
+default for everything, or **a different model per Agent Teams teammate**.
 
 ```text
-you: /subagent-model set bifrost/anthropic/claude-haiku-5-5
+default: bifrost/anthropic/claude-haiku-5-5
+adversary: bifrost/anthropic/claude-sonnet-5-5
 
-subagent(...)          → child runs on bifrost/anthropic/claude-haiku-5-5
-spawn_teammate(...)    → teammate runs on bifrost/anthropic/claude-haiku-5-5
-workflow agent(...)    → child runs on bifrost/anthropic/claude-haiku-5-5
+subagent(...)             → haiku
+spawn_teammate("scout")   → haiku
+spawn_teammate("adversary") → sonnet
+workflow agent(...)       → haiku
 ```
 
 The main agent keeps its own route. Only delegated children are affected.
@@ -56,11 +58,17 @@ once with `/subagent-model` (a user choice that survives restarts).
 - id: subagent-model
   config:
     provider: bifrost
-    model: anthropic/claude-haiku-5-5
+    model: anthropic/claude-haiku-5-5     # default for unmapped children
+    members:                              # one route per teammate, by name
+      adversary: bifrost/anthropic/claude-sonnet-5-5
+      reviewer: bifrost/anthropic/claude-sonnet-5-5
     # reasoningEffort: low      # optional, adapter-owned
-    # providers: [spawn]        # which subagent providers to stamp (default)
+    # providers: [spawn]        # which subagent providers the DEFAULT is stamped on
     # enabled: true             # false = full no-op
 ```
+
+`members` values take either `"<provider>/<model>"` or
+`{ provider, model, reasoningEffort? }`.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -69,6 +77,7 @@ once with `/subagent-model` (a user choice that survives restarts).
 | `reasoningEffort` | unset | Adapter-owned effort for the child route |
 | `enabled` | `true` | `false` disables stamping entirely |
 | `providers` | `['spawn']` | Subagent provider names to stamp. Add `fork` only if you accept losing its inherited-prefix KV cache reuse |
+| `members` | `{}` | Teammate name → its own route. Resolved from the team roster by the reserved child id, so it applies to `spawn_teammate` children only |
 | `stateFile` | `~/.dsh-tui/subagent-model.json` | Where the `/subagent-model` choice is persisted |
 
 The persisted choice wins over the row config; `reset` drops it and falls back
@@ -79,7 +88,9 @@ to the config default.
 | Command | Effect |
 | --- | --- |
 | `/subagent-model` | Status: effective route, where it came from, which providers are stamped, how many delegations were remapped this run |
-| `/subagent-model set <provider>/<model> [effort]` | Validate the route against the live adapter, persist it, use it for new delegations |
+| `/subagent-model set <provider>/<model> [effort]` | Validate the default route against the live adapter, persist it, use it for new delegations |
+| `/subagent-model set <member>=<provider>/<model> [effort]` | Give one teammate its own route (e.g. `set adversary=bifrost/anthropic/claude-sonnet-5-5`) |
+| `/subagent-model unset <member>` | Drop a teammate route; it falls back to the default |
 | `/subagent-model off` | Stop stamping (children inherit the parent route); keeps the route for `on` |
 | `/subagent-model on` | Resume with the route saved by the last `set` |
 | `/subagent-model reset` | Delete the persisted choice, fall back to the row config |
@@ -93,6 +104,11 @@ slash separates the provider from the model.
 
 - **Stamp what you configure.** A delegation with no route of its own gets the
   configured one.
+- **A teammate mapping wins over the default.** The name comes from the team
+  roster (`ctx.agentTeams.listMembers(lead)`), matched by the reserved child id
+  the team journals before it spawns. A member mapping is explicit intent, so it
+  applies even to a `fork`-context teammate — the `providers` gate only governs
+  the default route.
 - **An explicit route always wins.** The model's `provider`/`model` arguments (on
   a model-selectable `subagent` tool), a workflow script's `agentOptions`, or a
   configured child default are left byte-for-byte untouched.
@@ -122,6 +138,11 @@ route before creating the child. The plugin registers on cordis's documented
 service-read waterfall (`internal/get`), wraps the `subagents` **value** on read
 (the real service object is never mutated), and stamps `agentOptions` in
 `startActivation` before delegating.
+
+For a teammate, `startActivation` carries the reserved `childId` the team
+journals (with its name) and flushes **before** spawning. The plugin looks that
+id up in the roster, so `members.adversary` resolves without the model having to
+pass anything.
 
 Any failure in the wrapper degrades to the native path: a delegation is never
 turned into an error by this plugin.

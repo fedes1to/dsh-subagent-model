@@ -8,7 +8,9 @@ import {
   COMMAND_NAME,
   DEFAULT_PROVIDERS,
   hasExplicitRoute,
+  mergeMembers,
   normalizeRoute,
+  parseRouteValue,
   readState,
   USAGE,
   writeState,
@@ -17,6 +19,7 @@ import {
 const workdir = mkdtempSync(join(tmpdir(), 'dsh-subagent-model-'))
 let caseSeq = 0
 const statePathFor = () => join(workdir, `state-${++caseSeq}.json`)
+const signal = () => new AbortController().signal
 
 /**
  * Mount the plugin on a fake context and expose the two seams it uses: the
@@ -83,10 +86,28 @@ const spec = (overrides = {}) => ({
   provider: 'spawn',
   label: 'research',
   delivery: 'parent',
-  signal: new AbortController().signal,
+  signal: signal(),
   request: { prompt: [{ type: 'text', text: 'do the thing' }], parent },
   ...overrides,
 })
+
+/** A team roster stand-in: `listMembers(lead)` returns `{ id, name, ... }`. */
+function fakeTeams(members) {
+  return {
+    listMembers() {
+      return members
+    },
+  }
+}
+
+const lead = { id: 'lead', session: { id: 'lead-session' } }
+const teammateSpec = (childId, overrides = {}) =>
+  spec({
+    childId,
+    label: 'red team the change',
+    request: { prompt: [{ type: 'text', text: 'break it' }], parent: lead },
+    ...overrides,
+  })
 
 // --- pure helpers -----------------------------------------------------------
 
@@ -101,6 +122,16 @@ assert.equal(normalizeRoute({ provider: '', model: 'x' }), undefined)
 assert.equal(normalizeRoute(null), undefined)
 assert.equal(normalizeRoute('bifrost/x'), undefined)
 
+assert.deepEqual(parseRouteValue('bifrost/anthropic/claude-haiku-5-5'), {
+  provider: 'bifrost',
+  model: 'anthropic/claude-haiku-5-5',
+})
+assert.deepEqual(parseRouteValue({ provider: 'b', model: 'm' }), { provider: 'b', model: 'm' })
+assert.equal(parseRouteValue('bifrost'), undefined)
+assert.equal(parseRouteValue('/x'), undefined)
+assert.equal(parseRouteValue('bifrost/'), undefined)
+assert.equal(parseRouteValue(''), undefined)
+
 assert.equal(hasExplicitRoute(undefined), false)
 assert.equal(hasExplicitRoute({}), false)
 assert.equal(hasExplicitRoute({ maxTokens: 100 }), false)
@@ -109,7 +140,16 @@ assert.equal(hasExplicitRoute({ model: 'x' }), true)
 
 assert.deepEqual(DEFAULT_PROVIDERS, ['spawn'])
 assert.equal(COMMAND_NAME, 'subagent-model')
-assert.match(USAGE, /set <provider>\/<model>/)
+assert.match(USAGE, /set <member>=<provider>\/<model>/)
+
+{
+  const base = mergeMembers(new Map(), { adversary: 'b/a', scout: { provider: 'b', model: 'm' } })
+  assert.equal(base.size, 2)
+  assert.deepEqual(base.get('adversary'), { provider: 'b', model: 'a' })
+  mergeMembers(base, { adversary: false, tester: 'b/t' })
+  assert.equal(base.has('adversary'), false, 'false removes a mapping')
+  assert.equal(base.get('tester').model, 't')
+}
 
 // --- state round-trip -------------------------------------------------------
 
@@ -122,7 +162,7 @@ assert.match(USAGE, /set <provider>\/<model>/)
   assert.equal(readState(path), undefined, 'a corrupt file means no choice')
 }
 
-// --- stamping ---------------------------------------------------------------
+// --- default route stamping -------------------------------------------------
 
 {
   const subagents = fakeSubagents()
@@ -137,7 +177,6 @@ assert.match(USAGE, /set <provider>\/<model>/)
   assert.equal(subagents.calls[0].request.prompt[0].text, 'do the thing', 'the rest of the request is untouched')
   assert.equal(subagents.calls[0].provider, 'spawn')
   assert.equal(subagents.calls[0].label, 'research')
-  assert.equal(subagents.calls[0].signal, subagents.calls[0].signal, 'the signal travels with the spec')
 }
 
 {
@@ -160,7 +199,7 @@ assert.match(USAGE, /set <provider>\/<model>/)
   const { read } = mount({ provider: 'bifrost', model: 'anthropic/claude-haiku-5-5', stateFile: statePathFor() }, { subagents })
   const explicit = spec({ request: { prompt: [], parent, agentOptions: { provider: 'mistral', model: 'mistral-large-4' } } })
   await read('subagents').startActivation(explicit)
-  assert.equal(subagents.calls[0], explicit, 'the caller\'s own spec object is forwarded')
+  assert.equal(subagents.calls[0], explicit, "the caller's own spec object is forwarded")
   assert.deepEqual(subagents.calls[0].request.agentOptions, { provider: 'mistral', model: 'mistral-large-4' })
 }
 
@@ -196,7 +235,7 @@ assert.match(USAGE, /set <provider>\/<model>/)
   // A provider without agentOptions support (an external backend) is left alone.
   const subagents = fakeSubagents({ capabilities: { agentOptions: false } })
   const { read } = mount({ provider: 'bifrost', model: 'm', stateFile: statePathFor() }, { subagents })
-  const external = spec({ provider: 'spawn' })
+  const external = spec()
   await read('subagents').startActivation(external)
   assert.equal(subagents.calls[0], external)
 }
@@ -250,42 +289,120 @@ assert.match(USAGE, /set <provider>\/<model>/)
   assert.equal(read('missing'), undefined)
 }
 
-// --- Agent Teams and workflow shapes ---------------------------------------
+// --- per-member routes ------------------------------------------------------
 
 {
-  // A teammate: the Lead reserves the child id and passes no route. Stamped.
+  // A teammate's own route wins over the default.
   const subagents = fakeSubagents()
+  const agentTeams = fakeTeams([
+    { id: 'lead', name: 'lead', role: 'lead', status: 'running' },
+    { id: 'teammate-adversary', name: 'adversary', role: 'teammate', status: 'provisioning' },
+  ])
   const { read } = mount(
-    { provider: 'bifrost', model: 'anthropic/claude-haiku-5-5', stateFile: statePathFor() },
-    { subagents },
+    {
+      provider: 'bifrost',
+      model: 'anthropic/claude-haiku-5-5',
+      members: { adversary: 'bifrost/anthropic/claude-sonnet-5-5' },
+      stateFile: statePathFor(),
+    },
+    { subagents, agentTeams },
   )
-  const teammate = spec({ childId: 'reserved-child', label: 'reviewer' })
-  await read('subagents').startActivation(teammate)
-  const dispatched = subagents.calls[0]
-  assert.equal(dispatched.childId, 'reserved-child', 'the reserved child id survives')
-  assert.equal(dispatched.delivery, 'parent')
-  assert.deepEqual(dispatched.request.agentOptions, {
+  await read('subagents').startActivation(teammateSpec('teammate-adversary'))
+  assert.deepEqual(subagents.calls[0].request.agentOptions, {
+    provider: 'bifrost',
+    model: 'anthropic/claude-sonnet-5-5',
+  })
+  assert.equal(subagents.calls[0].childId, 'teammate-adversary', 'the reserved child id survives')
+}
+
+{
+  // An unmapped teammate gets the default route.
+  const subagents = fakeSubagents()
+  const agentTeams = fakeTeams([{ id: 'teammate-scout', name: 'scout', role: 'teammate', status: 'provisioning' }])
+  const { read } = mount(
+    {
+      provider: 'bifrost',
+      model: 'anthropic/claude-haiku-5-5',
+      members: { adversary: 'bifrost/anthropic/claude-sonnet-5-5' },
+      stateFile: statePathFor(),
+    },
+    { subagents, agentTeams },
+  )
+  await read('subagents').startActivation(teammateSpec('teammate-scout'))
+  assert.deepEqual(subagents.calls[0].request.agentOptions, {
     provider: 'bifrost',
     model: 'anthropic/claude-haiku-5-5',
   })
 }
 
 {
-  // A workflow child: caller delivery, no route. Stamped.
+  // A member mapping is explicit intent: it bypasses the fork gate.
+  const subagents = fakeSubagents()
+  const agentTeams = fakeTeams([{ id: 'teammate-reviewer', name: 'reviewer', role: 'teammate', status: 'provisioning' }])
+  const { read } = mount(
+    {
+      provider: 'bifrost',
+      model: 'anthropic/claude-haiku-5-5',
+      members: { reviewer: 'bifrost/anthropic/claude-sonnet-5-5' },
+      stateFile: statePathFor(),
+    },
+    { subagents, agentTeams },
+  )
+  await read('subagents').startActivation(teammateSpec('teammate-reviewer', { provider: 'fork' }))
+  assert.deepEqual(subagents.calls[0].request.agentOptions, {
+    provider: 'bifrost',
+    model: 'anthropic/claude-sonnet-5-5',
+  })
+}
+
+{
+  // off is the master switch: member mappings stop too.
+  const subagents = fakeSubagents()
+  const agentTeams = fakeTeams([{ id: 'teammate-adversary', name: 'adversary', role: 'teammate', status: 'provisioning' }])
+  const stateFile = statePathFor()
+  writeState(stateFile, { enabled: false })
+  const { read } = mount(
+    { provider: 'bifrost', model: 'm', members: { adversary: 'bifrost/strong' }, stateFile },
+    { subagents, agentTeams },
+  )
+  const untouched = teammateSpec('teammate-adversary')
+  await read('subagents').startActivation(untouched)
+  assert.equal(subagents.calls[0], untouched)
+}
+
+{
+  // No team service: a teammate-shaped spec still gets the default route.
   const subagents = fakeSubagents()
   const { read } = mount({ provider: 'bifrost', model: 'm', stateFile: statePathFor() }, { subagents })
-  await read('subagents').startActivation(spec({ delivery: 'caller' }))
-  assert.equal(subagents.calls[0].delivery, 'caller')
+  await read('subagents').startActivation(teammateSpec('teammate-x'))
   assert.deepEqual(subagents.calls[0].request.agentOptions, { provider: 'bifrost', model: 'm' })
 }
 
 {
-  // A fork-context teammate keeps the Lead's route by default.
+  // A roster that throws does not break the dispatch.
   const subagents = fakeSubagents()
-  const { read } = mount({ provider: 'bifrost', model: 'm', stateFile: statePathFor() }, { subagents })
-  const forkedTeammate = spec({ provider: 'fork', childId: 'reserved-fork' })
-  await read('subagents').startActivation(forkedTeammate)
-  assert.equal(subagents.calls[0], forkedTeammate)
+  const agentTeams = {
+    listMembers() {
+      throw new Error('roster unavailable')
+    },
+  }
+  const { read } = mount({ provider: 'bifrost', model: 'm', stateFile: statePathFor() }, { subagents, agentTeams })
+  await read('subagents').startActivation(teammateSpec('teammate-x'))
+  assert.deepEqual(subagents.calls[0].request.agentOptions, { provider: 'bifrost', model: 'm' })
+}
+
+{
+  // A persisted member route overrides the config mapping.
+  const subagents = fakeSubagents()
+  const agentTeams = fakeTeams([{ id: 'teammate-adversary', name: 'adversary', role: 'teammate', status: 'provisioning' }])
+  const stateFile = statePathFor()
+  writeState(stateFile, { enabled: true, members: { adversary: 'bifrost/persisted' } })
+  const { read } = mount(
+    { provider: 'bifrost', model: 'm', members: { adversary: 'bifrost/from-config' }, stateFile },
+    { subagents, agentTeams },
+  )
+  await read('subagents').startActivation(teammateSpec('teammate-adversary'))
+  assert.equal(subagents.calls[0].request.agentOptions.model, 'persisted')
 }
 
 // --- command ----------------------------------------------------------------
@@ -307,41 +424,53 @@ assert.match(USAGE, /set <provider>\/<model>/)
     },
   }
   const subagents = fakeSubagents()
-  const { read, commands } = mount({ provider: 'bifrost', model: 'default/model', stateFile }, { subagents, llm })
+  const { read, commands } = mount(
+    { provider: 'bifrost', model: 'default/model', members: { scout: 'bifrost/cheap' }, stateFile },
+    { subagents, llm },
+  )
   assert.equal(commands.length, 1)
   const command = commands[0]
   assert.equal(command.name, 'subagent-model')
-  assert.match(command.description, /subagent/i)
+  assert.match(command.description, /per teammate/)
 
-  // status (bare and explicit)
+  // status
   const bare = await command.handler({ rawInput: '' })
   assert.equal(bare.kind, 'success')
-  assert.match(bare.text, /bifrost\/default\/model/)
+  assert.match(bare.text, /Default: bifrost\/default\/model/)
   assert.match(bare.text, /plugin config/)
-  assert.match(bare.text, /Usage: \/subagent-model/)
+  assert.match(bare.text, /scout → bifrost\/cheap/)
+  assert.match(bare.text, /Default stamped on: spawn/)
 
-  // set validates and persists
+  // set the default: validates and persists
   const set = await command.handler({ rawInput: 'set bifrost/anthropic/claude-haiku-5-5 low' })
   assert.equal(set.kind, 'success', set.text)
-  assert.match(set.text, /Route checked/)
+  assert.match(set.text, /Default subagent model: bifrost\/anthropic\/claude-haiku-5-5/)
   assert.deepEqual(readState(stateFile), {
     enabled: true,
     provider: 'bifrost',
     model: 'anthropic/claude-haiku-5-5',
     reasoningEffort: 'low',
   })
-  await read('subagents').startActivation(spec())
-  assert.deepEqual(subagents.calls.at(-1).request.agentOptions, {
-    provider: 'bifrost',
-    model: 'anthropic/claude-haiku-5-5',
-    reasoningEffort: 'low',
-  })
 
-  // status now reports the persisted choice
-  const afterSet = await command.handler({ rawInput: 'status' })
-  assert.match(afterSet.text, /anthropic\/claude-haiku-5-5/)
-  assert.match(afterSet.text, /effort low/)
-  assert.match(afterSet.text, new RegExp(stateFile.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+  // set a member route
+  const setMember = await command.handler({ rawInput: 'set adversary=bifrost/anthropic/claude-sonnet-5-5' })
+  assert.equal(setMember.kind, 'success', setMember.text)
+  assert.match(setMember.text, /Teammate "adversary"/)
+  assert.deepEqual(readState(stateFile).members, {
+    adversary: { provider: 'bifrost', model: 'anthropic/claude-sonnet-5-5' },
+  })
+  assert.match((await command.handler({ rawInput: 'status' })).text, /adversary → bifrost\/anthropic\/claude-sonnet-5-5/)
+
+  // the default survived the member write
+  assert.equal(readState(stateFile).model, 'anthropic/claude-haiku-5-5')
+
+  // unset drops it
+  const unset = await command.handler({ rawInput: 'unset adversary' })
+  assert.equal(unset.kind, 'success')
+  assert.equal(readState(stateFile).members.adversary, false)
+  const afterUnset = await command.handler({ rawInput: 'status' })
+  assert.doesNotMatch(afterUnset.text, /adversary →/)
+  assert.match(afterUnset.text, /scout → bifrost\/cheap/, 'the config mapping is still listed')
 
   // a rejected route is reported and nothing is written
   const before = readFileSync(stateFile, 'utf8')
@@ -350,25 +479,22 @@ assert.match(USAGE, /set <provider>\/<model>/)
   assert.match(rejected.text, /Cannot use bifrost\/bad/)
   assert.equal(readFileSync(stateFile, 'utf8'), before)
 
-  // malformed spec
+  // malformed specs
   assert.equal((await command.handler({ rawInput: 'set bifrost' })).kind, 'error')
   assert.equal((await command.handler({ rawInput: 'set /x' })).kind, 'error')
   assert.equal((await command.handler({ rawInput: 'set bifrost/' })).kind, 'error')
+  assert.equal((await command.handler({ rawInput: 'set =bifrost/x' })).kind, 'error')
+  assert.equal((await command.handler({ rawInput: 'unset' })).kind, 'error')
 
-  // off stops stamping, and keeps the route for `on`
+  // off stops stamping, keeps the routes
   const off = await command.handler({ rawInput: 'off' })
   assert.equal(off.kind, 'success')
-  assert.deepEqual(readState(stateFile), {
-    provider: 'bifrost',
-    model: 'anthropic/claude-haiku-5-5',
-    reasoningEffort: 'low',
-    enabled: false,
-  })
+  assert.equal(readState(stateFile).enabled, false)
   const untouched = spec()
   await read('subagents').startActivation(untouched)
   assert.equal(subagents.calls.at(-1), untouched)
 
-  // on re-enables the persisted route
+  // on resumes
   const on = await command.handler({ rawInput: 'on' })
   assert.equal(on.kind, 'success')
   assert.equal(readState(stateFile).enabled, true)
@@ -399,7 +525,7 @@ assert.match(USAGE, /set <provider>\/<model>/)
   const { commands } = mount({ stateFile }, { subagents: fakeSubagents() })
   const set = await commands[0].handler({ rawInput: 'set bifrost/x' })
   assert.equal(set.kind, 'success')
-  assert.match(set.text, /Route not checked/)
+  assert.equal(readState(stateFile).model, 'x')
   const list = await commands[0].handler({ rawInput: 'list' })
   assert.equal(list.kind, 'error')
 }

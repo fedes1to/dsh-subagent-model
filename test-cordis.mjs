@@ -68,12 +68,24 @@ const registered = []
 const root = new Context()
 root.provide('subagents', fakeSubagents)
 root.provide('commands', { register: (definition) => (registered.push(definition), () => {}) })
+root.provide('agentTeams', {
+  listMembers: () => [
+    { id: 'lead', name: 'lead', role: 'lead', status: 'running' },
+    { id: 'teammate-adversary', name: 'adversary', role: 'teammate', status: 'provisioning' },
+  ],
+})
 
 const stateFile = join(mkdtempSync(join(tmpdir(), 'dsh-subagent-model-cordis-')), 'state.json')
 
 await root.plugin({
   name: 'subagent-model',
-  apply: (ctx) => apply(ctx, { provider: 'bifrost', model: 'anthropic/claude-haiku-5-5', stateFile }),
+  apply: (ctx) =>
+    apply(ctx, {
+      provider: 'bifrost',
+      model: 'anthropic/claude-haiku-5-5',
+      members: { adversary: 'bifrost/anthropic/claude-sonnet-5-5' },
+      stateFile,
+    }),
 })
 
 const parent = { id: 'parent', session: { id: 'parent-session' } }
@@ -123,6 +135,22 @@ const forked = {
 }
 await seen.startActivation(forked)
 assert.equal(calls[2], forked)
+
+// A teammate resolves its own route from the roster (name by reserved child id).
+const teammate = {
+  provider: 'spawn',
+  label: 'red team the change',
+  delivery: 'parent',
+  childId: 'teammate-adversary',
+  signal: new AbortController().signal,
+  request: { prompt: [], parent },
+}
+await seen.startActivation(teammate)
+assert.deepEqual(calls[3].request.agentOptions, {
+  provider: 'bifrost',
+  model: 'anthropic/claude-sonnet-5-5',
+})
+assert.equal(calls[3].childId, 'teammate-adversary')
 
 // The command registered through the plain registry.
 assert.equal(registered.length, 1)

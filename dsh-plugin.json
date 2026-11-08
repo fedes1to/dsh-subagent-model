@@ -30,7 +30,7 @@
       {
         "id": "subagent-model.subagent-model",
         "title": "Subagent model",
-        "description": "/subagent-model chooses the provider/model delegated children run on; set <provider>/<model> [effort], off, on, reset, list"
+        "description": "/subagent-model chooses the provider/model delegated children run on, per teammate when you want: set [<member>=]<provider>/<model> [effort], unset <member>, off, on, reset, list"
       }
     ]
   },

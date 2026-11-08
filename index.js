@@ -1,5 +1,6 @@
 /**
- * dsh-subagent-model — run delegated children on a model of your choosing.
+ * dsh-subagent-model — run delegated children on a model of your choosing,
+ * per teammate when you want it.
  *
  * Every delegation in dsh funnels through one call: `ctx.subagents.startActivation()`.
  * That covers the `subagent` and `subagent_fork` tools, workflow `agent()`
@@ -9,15 +10,20 @@
  * `resolveChildAgentOptions` merges it over the parent's values).
  *
  * This plugin wraps the `subagents` service on the documented cordis
- * service-read waterfall (`internal/get`) and stamps that route onto every
+ * service-read waterfall (`internal/get`) and stamps a route onto every
  * delegation that does not already name one. A route the caller chose — the
  * model's own `provider`/`model` arguments, a workflow script's `agentOptions`,
  * a configured child default — is treated as authorized and never touched.
  *
- * Why a wrapper and not a config key: the delegation rows live inside the agent
- * presets, so a profile patch cannot reach them, and `spawn_teammate` takes no
- * model argument at all. The service read is the one seam every dispatch path
- * shares.
+ * Routes resolve per delegation:
+ *
+ * 1. `members.<name>` — a teammate's own route. The team journals
+ *    `{id: childId, name}` and flushes it BEFORE `startActivation`, so the name
+ *    is read from `ctx.agentTeams.listMembers(lead)` by the reserved child id.
+ *    A member mapping is explicit intent: it bypasses the `providers` gate.
+ * 2. The default route (`provider`/`model` from config or `/subagent-model set`),
+ *    applied only to the providers listed in `providers`.
+ * 3. Nothing — the child inherits the parent route.
  *
  * The choice is changeable at runtime with `/subagent-model` and survives a
  * restart (`~/.dsh-tui/subagent-model.json`, the same directory `/model` uses).
@@ -38,7 +44,7 @@ export const SEAM_EVENT = 'internal/get'
 /** The service the wrapper wraps. */
 export const SEAM_SERVICE = 'subagents'
 
-/** Providers stamped by default: fresh children only (fork keeps its prefix). */
+/** Providers the DEFAULT route is stamped on (fresh children only). */
 export const DEFAULT_PROVIDERS = ['spawn']
 
 /** State file name under `~/.dsh-tui`. */
@@ -48,8 +54,13 @@ export const STATE_FILE = 'subagent-model.json'
 export const COMMAND_NAME = 'subagent-model'
 
 /** What the command accepts, shown in the composer and in every usage error. */
-export const USAGE =
-  '/subagent-model [status] | set <provider>/<model> [effort] | off | on | reset | list [provider]'
+export const USAGE = [
+  '/subagent-model [status]',
+  '  set <provider>/<model> [effort]        default route for unmapped children',
+  '  set <member>=<provider>/<model> [effort]  one teammate (e.g. adversary=...)',
+  '  unset <member>                         drop a teammate route',
+  '  off | on | reset | list [provider]',
+].join('\n')
 
 /**
  * Coerce one config or state value into an exact child route.
@@ -66,6 +77,42 @@ export function normalizeRoute(value) {
       ? value.reasoningEffort.trim()
       : undefined
   return { provider, model, ...(effort === undefined ? {} : { reasoningEffort: effort }) }
+}
+
+/**
+ * Parse a route written either as an object or as `"<provider>/<model>"`.
+ * Model ids carry slashes (`anthropic/claude-haiku-5-5`); provider ids never
+ * do, so the FIRST slash separates the two halves.
+ * @param {unknown} value - config, state, or command value.
+ * @returns {{ provider: string, model: string, reasoningEffort?: string } | undefined} the route.
+ */
+export function parseRouteValue(value) {
+  if (typeof value !== 'string') return normalizeRoute(value)
+  const text = value.trim()
+  if (text === '') return undefined
+  const slash = text.indexOf('/')
+  if (slash <= 0 || slash === text.length - 1) return undefined
+  return { provider: text.slice(0, slash), model: text.slice(slash + 1) }
+}
+
+/**
+ * Merge a member-route map into `into`. `false`/`null` removes an entry, so a
+ * persisted `unset` can override a config mapping.
+ * @param {Map<string, object>} into - map to merge into.
+ * @param {unknown} value - `{ <member>: route | false }`.
+ * @returns {Map<string, object>} `into`.
+ */
+export function mergeMembers(into, value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return into
+  for (const [member, routeValue] of Object.entries(value)) {
+    if (routeValue === false || routeValue === null) {
+      into.delete(member)
+      continue
+    }
+    const route = parseRouteValue(routeValue)
+    if (route !== undefined) into.set(member, route)
+  }
+  return into
 }
 
 /**
@@ -137,13 +184,16 @@ export function hasExplicitRoute(agentOptions) {
  *   reasoningEffort?: string,
  *   enabled?: boolean,
  *   providers?: string[],
+ *   members?: Record<string, unknown>,
  *   stateFile?: string,
- * }} [config] - Row config. `provider`/`model` are the deployment default;
- *   the persisted `/subagent-model` choice wins over them.
+ * }} [config] - Row config. `provider`/`model` are the default child route;
+ *   `members` maps a teammate name to its own route. The persisted
+ *   `/subagent-model` choice wins over both.
  */
 export function apply(ctx, config = {}) {
   const configRoute = normalizeRoute(config)
   const configEnabled = config.enabled !== false
+  const configMembers = mergeMembers(new Map(), config.members)
   const providers = new Set(asStringList(config.providers, DEFAULT_PROVIDERS))
   const statePath =
     typeof config.stateFile === 'string' && config.stateFile !== ''
@@ -155,18 +205,45 @@ export function apply(ctx, config = {}) {
   let warnedUnknownProvider = false
 
   /**
-   * The route in force right now: persisted choice, else the row config.
-   * @returns {{ enabled: boolean, route?: { provider: string, model: string, reasoningEffort?: string }, source: 'state' | 'config' | 'none' }} the effective choice.
+   * The teammate name behind one activation, read from the team roster by the
+   * reserved child id. The team journals the member and flushes it BEFORE
+   * calling `startActivation`, so the row is already there.
+   * @param {object} spec - the activation spec.
+   * @returns {string | undefined} the teammate name, or undefined for a non-teammate.
    */
-  const effective = () => {
-    const state = readState(statePath)
-    if (state?.enabled === false) return { enabled: false, source: 'state' }
-    const fromState = normalizeRoute(state)
-    if (fromState !== undefined) return { enabled: true, route: fromState, source: 'state' }
-    if (configEnabled && configRoute !== undefined) {
-      return { enabled: true, route: configRoute, source: 'config' }
+  const memberNameOf = (spec) => {
+    const childId = spec?.childId
+    const parent = spec?.request?.parent
+    if (typeof childId !== 'string' || childId === '' || parent === undefined) return undefined
+    const teams = ctx.get('agentTeams', false)
+    if (teams === null || teams === undefined || typeof teams.listMembers !== 'function') return undefined
+    try {
+      const member = teams.listMembers(parent).find((candidate) => candidate?.id === childId)
+      return typeof member?.name === 'string' && member.name !== '' ? member.name : undefined
+    } catch {
+      // A roster read that fails is not a routing decision: fall through.
+      return undefined
     }
-    return { enabled: false, source: 'none' }
+  }
+
+  /**
+   * The route in force for one delegation, and where it came from.
+   * @param {object} spec - the activation spec.
+   * @returns {{ route: { provider: string, model: string, reasoningEffort?: string }, source: string, member: boolean } | undefined} the choice.
+   */
+  const choiceFor = (spec) => {
+    const state = readState(statePath)
+    if (state?.enabled === false) return undefined
+    const members = mergeMembers(new Map(configMembers), state?.members)
+    const memberName = memberNameOf(spec)
+    if (memberName !== undefined) {
+      const mapped = members.get(memberName)
+      if (mapped !== undefined) return { route: mapped, source: `member:${memberName}`, member: true }
+    }
+    const fromState = normalizeRoute(state)
+    if (fromState !== undefined) return { route: fromState, source: 'state', member: false }
+    if (configEnabled && configRoute !== undefined) return { route: configRoute, source: 'config', member: false }
+    return undefined
   }
 
   /**
@@ -205,18 +282,19 @@ export function apply(ctx, config = {}) {
   }
 
   /**
-   * Stamp the configured route onto one activation spec, or return it untouched.
+   * Stamp a route onto one activation spec, or return it untouched.
    * @param {object} service - the live `subagents` service value.
    * @param {object} spec - the caller's activation spec.
    * @returns {object} the spec to dispatch.
    */
   const stamp = (service, spec) => {
-    const choice = effective()
-    if (!choice.enabled || choice.route === undefined) return spec
+    const choice = choiceFor(spec)
+    if (choice === undefined) return spec
     const request = spec?.request
     if (request === null || typeof request !== 'object') return spec
     if (hasExplicitRoute(request.agentOptions)) return spec
-    if (!providers.has(spec.provider)) return spec
+    // A member mapping is explicit intent; the default route respects the gate.
+    if (!choice.member && !providers.has(spec.provider)) return spec
     if (!supportsAgentOptions(service, spec.provider)) return spec
     if (!providerIsRegistered(choice.route.provider)) {
       if (!warnedUnknownProvider) {
@@ -241,6 +319,7 @@ export function apply(ctx, config = {}) {
     stats.last = {
       provider: choice.route.provider,
       model: choice.route.model,
+      source: choice.source,
       at: Date.now(),
       ...(typeof spec.label === 'string' && spec.label !== '' ? { label: spec.label } : {}),
     }
@@ -287,25 +366,59 @@ export function apply(ctx, config = {}) {
   /** @param {string} text - result body. */
   const failure = (text) => ({ kind: 'error', text })
 
+  /**
+   * The effective member map: config first, persisted choices over it.
+   * @returns {Map<string, object>} member name → route.
+   */
+  const effectiveMembers = () => mergeMembers(new Map(configMembers), readState(statePath)?.members)
+
+  /**
+   * The effective default route and where it came from.
+   * @returns {{ route?: object, source: 'state' | 'config' | 'none' }} the default.
+   */
+  const effectiveDefault = () => {
+    const state = readState(statePath)
+    const fromState = normalizeRoute(state)
+    if (fromState !== undefined) return { route: fromState, source: 'state' }
+    if (configEnabled && configRoute !== undefined) return { route: configRoute, source: 'config' }
+    return { source: 'none' }
+  }
+
   /** @returns {string} the status block. */
   const statusText = () => {
-    const choice = effective()
+    const state = readState(statePath)
     const lines = []
-    if (!choice.enabled) {
+    if (state?.enabled === false) {
       lines.push('Subagent model: off — children inherit the parent route.')
-      if (choice.source === 'state') lines.push(`Turned off in ${statePath}.`)
+      if (statePath !== '') lines.push(`Turned off in ${statePath}.`)
     } else {
-      const route = choice.route
-      const effort = route.reasoningEffort === undefined ? '' : ` · effort ${route.reasoningEffort}`
-      const origin = choice.source === 'state' ? statePath : 'plugin config'
-      lines.push(`Subagent model: ${route.provider}/${route.model}${effort} (from ${origin})`)
+      const fallback = effectiveDefault()
+      if (fallback.route === undefined) {
+        lines.push('Subagent model: no default — unmapped children inherit the parent route.')
+      } else {
+        const route = fallback.route
+        const effort = route.reasoningEffort === undefined ? '' : ` · effort ${route.reasoningEffort}`
+        const origin = fallback.source === 'state' ? statePath : 'plugin config'
+        lines.push(`Default: ${route.provider}/${route.model}${effort} (from ${origin})`)
+      }
+      const members = effectiveMembers()
+      if (members.size === 0) {
+        lines.push('Members: none — every teammate uses the default.')
+      } else {
+        lines.push('Members:')
+        for (const [member, route] of members) {
+          const effort = route.reasoningEffort === undefined ? '' : ` · effort ${route.reasoningEffort}`
+          lines.push(`  ${member} → ${route.provider}/${route.model}${effort}`)
+        }
+      }
+      lines.push(`Default stamped on: ${[...providers].join(', ')}`)
     }
-    lines.push(`Stamped on: ${[...providers].join(', ')} · ${stats.applied} delegation(s) remapped this run`)
+    lines.push(`${stats.applied} delegation(s) remapped this run`)
     if (stats.last !== undefined) {
       const label = stats.last.label === undefined ? '' : ` · ${stats.last.label}`
-      lines.push(`Last: ${stats.last.provider}/${stats.last.model}${label}`)
+      lines.push(`Last: ${stats.last.provider}/${stats.last.model} (${stats.last.source})${label}`)
     }
-    lines.push(`Usage: ${USAGE}`)
+    lines.push(`Usage:\n${USAGE}`)
     return lines.join('\n')
   }
 
@@ -339,15 +452,32 @@ export function apply(ctx, config = {}) {
   }
 
   /**
-   * `/subagent-model set <provider>/<model> [effort]`.
+   * Validate one route against the live adapter when possible.
+   * @param {{ provider: string, model: string, reasoningEffort?: string }} route - candidate.
+   * @returns {Promise<string | undefined>} an error message, or undefined when usable.
+   */
+  const validateRoute = async (route) => {
+    const llm = ctx.get('llm', false)
+    if (llm === null || llm === undefined || typeof llm.resolveCallConfig !== 'function') return undefined
+    try {
+      await llm.resolveCallConfig(route)
+      return undefined
+    } catch (error) {
+      return messageOf(error)
+    }
+  }
+
+  /**
+   * `/subagent-model set [<member>=]<provider>/<model> [effort]`.
    * @param {string[]} words - the words after `set`.
    * @returns {Promise<{ kind: 'success' | 'error', text: string }>} the result.
    */
   const setText = async (words) => {
-    const routeSpec = words[0]
-    if (routeSpec === undefined) return failure(`Expected <provider>/<model>.\n${USAGE}`)
-    // Model ids carry slashes (`anthropic/claude-haiku-5-5`); provider ids never
-    // do, so the FIRST slash separates the two halves.
+    const target = words[0]
+    if (target === undefined) return failure(`Expected <provider>/<model> or <member>=<provider>/<model>.\n${USAGE}`)
+    const equals = target.indexOf('=')
+    const member = equals > 0 ? target.slice(0, equals) : undefined
+    const routeSpec = equals > 0 ? target.slice(equals + 1) : target
     const slash = routeSpec.indexOf('/')
     if (slash <= 0 || slash === routeSpec.length - 1) {
       return failure(`Expected <provider>/<model>, got "${routeSpec}".\n${USAGE}`)
@@ -355,24 +485,42 @@ export function apply(ctx, config = {}) {
     const provider = routeSpec.slice(0, slash)
     const model = routeSpec.slice(slash + 1)
     const effort = words[1]
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(provider)) {
+      return failure(`"${provider}" is not a provider id (letters, digits, dot, dash).\n${USAGE}`)
+    }
+    if (member !== undefined && !/^[a-z][a-z0-9-]*$/u.test(member)) {
+      return failure(`"${member}" is not a teammate name (lower-kebab-case, e.g. adversary).\n${USAGE}`)
+    }
     const route = { provider, model, ...(effort === undefined ? {} : { reasoningEffort: effort }) }
 
-    const llm = ctx.get('llm', false)
-    let validated = false
-    if (llm !== null && llm !== undefined && typeof llm.resolveCallConfig === 'function') {
-      try {
-        await llm.resolveCallConfig(route)
-        validated = true
-      } catch (error) {
-        return failure(`Cannot use ${provider}/${model}: ${messageOf(error)}`)
-      }
+    const invalid = await validateRoute(route)
+    if (invalid !== undefined) return failure(`Cannot use ${provider}/${model}: ${invalid}`)
+
+    const state = readState(statePath) ?? {}
+    if (member === undefined) {
+      writeState(statePath, { ...state, enabled: true, provider, model, ...(effort === undefined ? {} : { reasoningEffort: effort }) })
+    } else {
+      const members = state.members !== null && typeof state.members === 'object' && !Array.isArray(state.members) ? state.members : {}
+      writeState(statePath, { ...state, enabled: true, members: { ...members, [member]: route } })
     }
-    writeState(statePath, { enabled: true, ...route })
     const effortNote = effort === undefined ? '' : ` · effort ${effort}`
-    const check = validated ? 'Route checked against the live adapter.' : 'Route not checked (no llm service).'
+    const scope = member === undefined ? 'Default subagent model' : `Teammate "${member}"`
     return success(
-      `Subagent model: ${provider}/${model}${effortNote}\n${check} Saved to ${statePath}.\nNew delegations use it; children already running keep their route.`,
+      `${scope}: ${provider}/${model}${effortNote}\nSaved to ${statePath}.\nNew delegations use it; children already running keep their route.`,
     )
+  }
+
+  /**
+   * `/subagent-model unset <member>`.
+   * @param {string | undefined} member - teammate name.
+   * @returns {{ kind: 'success' | 'error', text: string }} the result.
+   */
+  const unsetText = (member) => {
+    if (member === undefined) return failure(`Expected a member name.\n${USAGE}`)
+    const state = readState(statePath) ?? {}
+    const members = state.members !== null && typeof state.members === 'object' && !Array.isArray(state.members) ? state.members : {}
+    writeState(statePath, { ...state, members: { ...members, [member]: false } })
+    return success(`Teammate "${member}" no longer has its own route; it uses the default.`)
   }
 
   /**
@@ -388,15 +536,14 @@ export function apply(ctx, config = {}) {
     try {
       if (verb === 'status') return success(statusText())
       if (verb === 'off') {
-        // Keep the route so `on` returns to it instead of falling back to config.
-        const route = normalizeRoute(readState(statePath))
-        writeState(statePath, { ...(route ?? {}), enabled: false })
+        // Keep the routes so `on` returns to them instead of falling back to config.
+        const state = readState(statePath) ?? {}
+        writeState(statePath, { ...state, enabled: false })
         return success('Subagent model: off — children inherit the parent route.')
       }
       if (verb === 'on') {
-        const state = readState(statePath)
-        const route = normalizeRoute(state)
-        writeState(statePath, { ...(route ?? {}), enabled: true })
+        const state = readState(statePath) ?? {}
+        writeState(statePath, { ...state, enabled: true })
         return success(statusText())
       }
       if (verb === 'reset') {
@@ -407,6 +554,7 @@ export function apply(ctx, config = {}) {
         }
         return success(`Cleared ${statePath}.\n${statusText()}`)
       }
+      if (verb === 'unset') return unsetText(rest[0])
       if (verb === 'list') return await listText(rest[0])
       if (verb === 'set') return await setText(rest)
       return failure(`Unknown subcommand "${verb}".\n${USAGE}`)
@@ -417,8 +565,8 @@ export function apply(ctx, config = {}) {
 
   const definition = {
     name: COMMAND_NAME,
-    description: 'Choose the model delegated subagents and teammates run on',
-    input: { hint: 'status | set <provider>/<model> [effort] | off | on | reset | list [provider]' },
+    description: 'Choose the model delegated subagents and teammates run on, per teammate if you want',
+    input: { hint: 'status | set [<member>=]<provider>/<model> [effort] | unset <member> | off | on | reset | list [provider]' },
     handler,
   }
 
