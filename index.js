@@ -25,8 +25,8 @@
  *    applied only to the providers listed in `providers`.
  * 3. Nothing — the child inherits the parent route.
  *
- * The choice is changeable at runtime with `/subagent-model` and survives a
- * restart (`~/.dsh-tui/subagent-model.json`, the same directory `/model` uses).
+ * The choice is changeable at runtime via Settings or `/subagent-model` and
+ * survives a restart.
  *
  * @module dsh-subagent-model
  */
@@ -34,6 +34,7 @@
 import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
+import z from '@deepseek-ai/schemastery'
 
 /** Cordis row name. */
 export const name = 'subagent-model'
@@ -61,6 +62,44 @@ export const USAGE = [
   '  unset <member>                         drop a teammate route',
   '  off | on | reset | list [provider]',
 ].join('\n')
+
+/** Structured route value allowed inside `members`. */
+const MemberRouteSchema = z.object({
+  provider: z.string().required(),
+  model: z.string().required(),
+  reasoningEffort: z.string(),
+})
+
+/**
+ * Settings-page schema. Every routing field is volatile, so a save in
+ * Settings takes effect on the next delegation without waiting for a restart.
+ */
+export const Config = z.object({
+  /** Whether subagent model stamping is active. */
+  enabled: z.boolean().default(true).volatile(),
+  /** Default child provider id (for example `antigravity`, `llama-swap`, `grok`). */
+  provider: z.string().volatile(),
+  /** Default child model id. */
+  model: z.string().volatile(),
+  /** Optional reasoning effort for the default child route. */
+  reasoningEffort: z.string().volatile(),
+  /** Subagent provider names stamped with the default route. */
+  providers: z.array(z.string()).default(DEFAULT_PROVIDERS).volatile(),
+  /** Per-teammate route overrides (`<member>: "<provider>/<model>"` or route object). */
+  members: z.dict(z.union([z.string(), MemberRouteSchema])).default({}).volatile(),
+  /** Override path for the `/subagent-model` runtime state file. */
+  stateFile: z.string(),
+})
+
+/**
+ * Read one config field, following a volatile reference when the settings
+ * service wrapped it. A plain value passes through, so the tests and a host
+ * without settings keep calling `apply` as before.
+ * @param {unknown} value - field value or volatile reference.
+ * @returns {unknown} the current value.
+ */
+const readConfig = (value) =>
+  value !== null && typeof value === 'object' && typeof value.get === 'function' ? value.get() : value
 
 /**
  * Coerce one config or state value into an exact child route.
@@ -191,18 +230,27 @@ export function hasExplicitRoute(agentOptions) {
  *   `/subagent-model` choice wins over both.
  */
 export function apply(ctx, config = {}) {
-  const configRoute = normalizeRoute(config)
-  const configEnabled = config.enabled !== false
-  const configMembers = mergeMembers(new Map(), config.members)
-  const providers = new Set(asStringList(config.providers, DEFAULT_PROVIDERS))
+  // Read dynamically per call so Settings saves to volatile fields take effect
+  // on the next delegation without a restart. Plain config objects still pass
+  // straight through.
+  const isConfigEnabled = () => readConfig(config.enabled) !== false
+  const readConfigRoute = () =>
+    normalizeRoute({
+      provider: readConfig(config.provider),
+      model: readConfig(config.model),
+      reasoningEffort: readConfig(config.reasoningEffort),
+    })
+  const readConfigMembers = () => mergeMembers(new Map(), readConfig(config.members))
+  const readProviders = () => new Set(asStringList(readConfig(config.providers), DEFAULT_PROVIDERS))
+  const stateFileConfig = readConfig(config.stateFile)
   const statePath =
-    typeof config.stateFile === 'string' && config.stateFile !== ''
-      ? config.stateFile
+    typeof stateFileConfig === 'string' && stateFileConfig !== ''
+      ? stateFileConfig
       : join(homedir(), '.dsh-tui', STATE_FILE)
 
   /** Per-run counters for `/subagent-model status`. */
   const stats = { applied: 0, last: undefined }
-  let warnedUnknownProvider = false
+  let lastWarnedProvider
 
   /**
    * The teammate name behind one activation, read from the team roster by the
@@ -234,7 +282,9 @@ export function apply(ctx, config = {}) {
   const choiceFor = (spec) => {
     const state = readState(statePath)
     if (state?.enabled === false) return undefined
-    const members = mergeMembers(new Map(configMembers), state?.members)
+    const configEnabled = isConfigEnabled()
+    if (!configEnabled && state?.enabled !== true) return undefined
+    const members = mergeMembers(readConfigMembers(), state?.members)
     const memberName = memberNameOf(spec)
     if (memberName !== undefined) {
       const mapped = members.get(memberName)
@@ -242,6 +292,7 @@ export function apply(ctx, config = {}) {
     }
     const fromState = normalizeRoute(state)
     if (fromState !== undefined) return { route: fromState, source: 'state', member: false }
+    const configRoute = readConfigRoute()
     if (configEnabled && configRoute !== undefined) return { route: configRoute, source: 'config', member: false }
     return undefined
   }
@@ -294,11 +345,11 @@ export function apply(ctx, config = {}) {
     if (request === null || typeof request !== 'object') return spec
     if (hasExplicitRoute(request.agentOptions)) return spec
     // A member mapping is explicit intent; the default route respects the gate.
-    if (!choice.member && !providers.has(spec.provider)) return spec
+    if (!choice.member && !readProviders().has(spec.provider)) return spec
     if (!supportsAgentOptions(service, spec.provider)) return spec
     if (!providerIsRegistered(choice.route.provider)) {
-      if (!warnedUnknownProvider) {
-        warnedUnknownProvider = true
+      if (lastWarnedProvider !== choice.route.provider) {
+        lastWarnedProvider = choice.route.provider
         ctx.logger?.warn?.(
           `subagent-model: provider "${choice.route.provider}" is not registered; delegations keep the parent route`,
         )
@@ -370,7 +421,7 @@ export function apply(ctx, config = {}) {
    * The effective member map: config first, persisted choices over it.
    * @returns {Map<string, object>} member name → route.
    */
-  const effectiveMembers = () => mergeMembers(new Map(configMembers), readState(statePath)?.members)
+  const effectiveMembers = () => mergeMembers(readConfigMembers(), readState(statePath)?.members)
 
   /**
    * The effective default route and where it came from.
@@ -380,7 +431,8 @@ export function apply(ctx, config = {}) {
     const state = readState(statePath)
     const fromState = normalizeRoute(state)
     if (fromState !== undefined) return { route: fromState, source: 'state' }
-    if (configEnabled && configRoute !== undefined) return { route: configRoute, source: 'config' }
+    const configRoute = readConfigRoute()
+    if (isConfigEnabled() && configRoute !== undefined) return { route: configRoute, source: 'config' }
     return { source: 'none' }
   }
 
@@ -391,6 +443,8 @@ export function apply(ctx, config = {}) {
     if (state?.enabled === false) {
       lines.push('Subagent model: off — children inherit the parent route.')
       if (statePath !== '') lines.push(`Turned off in ${statePath}.`)
+    } else if (!isConfigEnabled() && state?.enabled !== true) {
+      lines.push('Subagent model: off — disabled in plugin config.')
     } else {
       const fallback = effectiveDefault()
       if (fallback.route === undefined) {
@@ -411,7 +465,7 @@ export function apply(ctx, config = {}) {
           lines.push(`  ${member} → ${route.provider}/${route.model}${effort}`)
         }
       }
-      lines.push(`Default stamped on: ${[...providers].join(', ')}`)
+      lines.push(`Default stamped on: ${[...readProviders()].join(', ')}`)
     }
     lines.push(`${stats.applied} delegation(s) remapped this run`)
     if (stats.last !== undefined) {

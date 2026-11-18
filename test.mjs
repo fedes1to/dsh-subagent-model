@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import {
   apply,
   COMMAND_NAME,
+  Config,
   DEFAULT_PROVIDERS,
   hasExplicitRoute,
   mergeMembers,
@@ -563,6 +564,89 @@ assert.match(USAGE, /set <member>=<provider>\/<model>/)
   const { warnings } = mount({ provider: 'bifrost', model: 'm', stateFile: statePathFor() }, registry)
   assert.equal(registered.length, 1)
   assert.ok(warnings.some((line) => line.includes('falling back')))
+}
+
+// --- volatile config (Settings UI live updates) ------------------------------
+
+{
+  const subagents = fakeSubagents()
+  const agentTeams = fakeTeams([{ id: 'teammate-adversary', name: 'adversary', role: 'teammate', status: 'provisioning' }])
+  const makeRef = (initial) => {
+    let current = initial
+    return {
+      get: () => current,
+      set: (next) => {
+        current = next
+      },
+    }
+  }
+  const enabledRef = makeRef(true)
+  const providerRef = makeRef('antigravity')
+  const modelRef = makeRef('gemini-4-flash')
+  const effortRef = makeRef(undefined)
+  const providersRef = makeRef(['spawn'])
+  const membersRef = makeRef({})
+
+  const { read, commands } = mount(
+    {
+      enabled: enabledRef,
+      provider: providerRef,
+      model: modelRef,
+      reasoningEffort: effortRef,
+      providers: providersRef,
+      members: membersRef,
+      stateFile: statePathFor(),
+    },
+    { subagents, agentTeams },
+  )
+
+  await read('subagents').startActivation(spec())
+  assert.deepEqual(subagents.calls.at(-1).request.agentOptions, {
+    provider: 'antigravity',
+    model: 'gemini-4-flash',
+  })
+
+  // Simulate a Settings UI save changing provider/model/effort/providers/members.
+  providerRef.set('grok')
+  modelRef.set('grok-4.7')
+  effortRef.set('high')
+  providersRef.set(['spawn', 'fork'])
+  membersRef.set({ adversary: { provider: 'antigravity', model: 'gemini-4-hydrogen', reasoningEffort: 'low' } })
+
+  await read('subagents').startActivation(spec({ provider: 'fork' }))
+  assert.deepEqual(subagents.calls.at(-1).request.agentOptions, {
+    provider: 'grok',
+    model: 'grok-4.7',
+    reasoningEffort: 'high',
+  })
+
+  await read('subagents').startActivation(teammateSpec('teammate-adversary'))
+  assert.deepEqual(subagents.calls.at(-1).request.agentOptions, {
+    provider: 'antigravity',
+    model: 'gemini-4-hydrogen',
+    reasoningEffort: 'low',
+  })
+
+  const statusLive = await commands[0].handler({ rawInput: 'status' })
+  assert.match(statusLive.text, /grok\/grok-4\.7 · effort high/)
+  assert.match(statusLive.text, /adversary → antigravity\/gemini-4-hydrogen · effort low/)
+
+  // Toggling enabled off stops both default and member stamping immediately.
+  enabledRef.set(false)
+  const untouched = teammateSpec('teammate-adversary')
+  await read('subagents').startActivation(untouched)
+  assert.equal(subagents.calls.at(-1), untouched)
+  assert.match((await commands[0].handler({ rawInput: 'status' })).text, /disabled in plugin config/)
+
+  // Config schema validates volatile fields and defaults.
+  assert.equal(Config.type, 'object')
+  assert.ok(Config.dict.enabled.meta.volatile)
+  assert.ok(Config.dict.provider.meta.volatile)
+  assert.ok(Config.dict.model.meta.volatile)
+  assert.ok(Config.dict.reasoningEffort.meta.volatile)
+  assert.ok(Config.dict.providers.meta.volatile)
+  assert.ok(Config.dict.members.meta.volatile)
+  assert.ok(!Config.dict.stateFile.meta.volatile)
 }
 
 console.log('dsh-subagent-model: all checks passed')

@@ -52,6 +52,23 @@ dsh plugin --profile dsh-tui add dsh-subagent-model
 The package declares `dsh.bundle.patch`, so `dsh plugin add` also appends it to
 `dsh.profile.bundles`. Restart the profile afterwards.
 
+## Install
+
+```sh
+dsh plugin --profile <profile> add <package-or-git-url>
+```
+
+Then restart the profile.
+
+## Settings
+
+On the web client the plugin adds a **Subagent model** section to Settings with
+every key below: the master enable switch, the default child route (`provider`,
+`model`, and `reasoningEffort` with a live model catalog picker), the stamped
+`providers` list, and per-teammate `members` overrides. A save takes effect on
+the next delegation without a restart. A deployment that never composed the
+plugin shows no section.
+
 ## Configure
 
 The row mounts with an empty config, so **nothing is stamped until you set a
